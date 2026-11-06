@@ -399,6 +399,130 @@ def test_paper_strategy_child_gets_scrubbed_env_and_private_cwd(sp, monkeypatch)
 
 
 # --------------------------------------------------------------------------- #
+# Paper child filesystem boundary, exercised through the real child process.
+# The child runs the source as given (the parent-side scanner is bypassed on
+# purpose), so these pin the boundary itself, not the scanner.
+# --------------------------------------------------------------------------- #
+
+_FS_ENGINE = "class SignalEngine:\n    def generate_signals(self, ctx, trade_date):\n{body}"
+
+
+def _paper_child_result(sp, body: str):
+    source = _FS_ENGINE.format(body=textwrap.indent(textwrap.dedent(body), " " * 8))
+    process, conn = sp.start_strategy_process(
+        {"source": source, "filename": "s.py", "days": ("2026-01-05",), "symbols": ()}
+    )
+    try:
+        assert conn.poll(60), "paper child never started"
+        message = conn.recv()
+        if message == ("ready",):
+            conn.send((None, {}))
+            assert conn.poll(60), "paper child never answered"
+            message = conn.recv()
+        return message
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        conn.close()
+
+
+@pytest.fixture()
+def secrets(tmp_path, monkeypatch):
+    """A fake home secret, and a non-code file inside a sys.path entry (the agent/.env shape)."""
+    home_secret = tmp_path / "home" / ".vibe-trading" / "okx.json"
+    home_secret.parent.mkdir(parents=True)
+    home_secret.write_text(CANARY, encoding="utf-8")
+    code_root = tmp_path / "code_root"
+    code_root.mkdir()
+    (code_root / ".env").write_text(f"OPENAI_API_KEY={CANARY}\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(code_root))
+    monkeypatch.delenv("VIBE_TRADING_SANDBOX_FS", raising=False)
+    return {"home": home_secret, "dotenv": code_root / ".env"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "return [open({home!r}).read()]",
+        "from pathlib import Path\nreturn [getattr(Path({home!r}), 'read_text')()]",
+        "return [open({dotenv!r}).read()]",
+        "import os\nreturn os.listdir({home_dir!r})",
+        "import os\nos.remove({home!r})\nreturn []",
+        "import os\nfd = os.open({home!r}, os.O_RDONLY)\nreturn [os.read(fd, 64)]",
+    ],
+    ids=["open_home", "getattr_read_text", "dotenv_on_sys_path", "listdir_home", "remove_home", "os_open"],
+)
+def test_paper_child_cannot_reach_host_files(sp, secrets, body) -> None:
+    body = body.format(home=str(secrets["home"]), dotenv=str(secrets["dotenv"]),
+                       home_dir=str(secrets["home"].parent))
+    message = _paper_child_result(sp, body)
+    assert message == ("error", "2026-01-05", "FileAccessDenied"), message
+    assert CANARY not in repr(message)
+    assert secrets["home"].read_text(encoding="utf-8") == CANARY
+
+
+def test_paper_child_keeps_its_own_workdir_and_lazy_imports(sp, secrets) -> None:
+    body = (
+        "import statistics, decimal, json\n"
+        "open('scratch.txt', 'w').write('1')\n"
+        "assert open('scratch.txt').read() == '1'\n"
+        "return []\n"
+    )
+    assert _paper_child_result(sp, body) == ("day", "2026-01-05", [])
+
+
+def test_required_fs_mode_refuses_without_a_mount_namespace(sp, monkeypatch) -> None:
+    monkeypatch.setenv("VIBE_TRADING_SANDBOX_FS", "required")
+    monkeypatch.setattr(sp.sys, "platform", "win32")
+    with pytest.raises(sp.SandboxFilesystemIsolationError):
+        sp.start_strategy_process({"source": "", "filename": "x.py", "days": (), "symbols": ()})
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="mount namespaces are Linux-only")
+def test_fs_isolation_prefix_hides_home_runtime_root_and_dotenv(sp, tmp_path, monkeypatch) -> None:
+    """Kernel layer alone (no audit hook in this child): host files are simply not there."""
+    home = tmp_path / "home"
+    (home / ".vibe-trading").mkdir(parents=True)
+    (home / ".vibe-trading" / "okx.json").write_text(CANARY, encoding="utf-8")
+    code_root = home / "app"  # code living under HOME must stay importable
+    code_root.mkdir()
+    (code_root / "probe_mod.py").write_text("VALUE = 7\n", encoding="utf-8")
+    (code_root / ".env").write_text(CANARY, encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("VIBE_TRADING_HOME", raising=False)
+    monkeypatch.syspath_prepend(str(code_root))
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    try:
+        prefix = sp._fs_isolation_prefix(str(workdir))
+    except sp.SandboxFilesystemIsolationError as exc:
+        pytest.skip(f"host cannot create the mount namespace: {exc}")
+    probe = (
+        "import json, os, sys\n"
+        f"sys.path.insert(0, {str(code_root)!r})\n"
+        "import probe_mod\n"
+        f"secret = os.path.exists({str(home / '.vibe-trading' / 'okx.json')!r})\n"
+        f"dotenv = open({str(code_root / '.env')!r}).read()\n"
+        "open('w.txt', 'w').write('ok')\n"
+        "print(json.dumps({'secret': secret, 'dotenv': dotenv, 'value': probe_mod.VALUE}))\n"
+    )
+    result = subprocess.run([*prefix, sys.executable, "-c", probe], cwd=workdir,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"secret": False, "dotenv": "", "value": 7}
+    assert (workdir / "w.txt").read_text() == "ok"
+    assert (home / ".vibe-trading" / "okx.json").read_text(encoding="utf-8") == CANARY
+
+
+def test_paper_child_guard_off_is_the_control(sp, secrets, monkeypatch) -> None:
+    """With the boundary off the same read succeeds, so the denials above are real."""
+    monkeypatch.setenv("VIBE_TRADING_SANDBOX_FS", "off")
+    body = f"open({str(secrets['home'])!r}).read()\nreturn []\n"
+    assert _paper_child_result(sp, body) == ("day", "2026-01-05", [])
+
+
+# --------------------------------------------------------------------------- #
 # P1.1: generated strategy code runs with no network
 # --------------------------------------------------------------------------- #
 

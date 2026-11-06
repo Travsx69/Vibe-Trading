@@ -13,19 +13,24 @@ directions use different encodings on purpose:
 
 The child also gets an allowlisted environment and an empty private working
 directory, so strategy code can read neither the parent's secrets nor
-relative files such as ``agent/.env``.
+relative files such as ``agent/.env``. File access while strategy code runs
+is confined by ``src.core.fs_guard``; with ``VIBE_TRADING_SANDBOX_FS=required``
+the child additionally starts in a Linux mount namespace (``_fs_isolation_prefix``).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import queue
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+from pathlib import Path
 from typing import Any
 
 # Largest single child message; orders for one day are far below this.
@@ -123,6 +128,82 @@ class StrategyConnection:
             shutil.rmtree(self.workdir, ignore_errors=True)
 
 
+class SandboxFilesystemIsolationError(RuntimeError):
+    """``VIBE_TRADING_SANDBOX_FS=required`` was asked for but cannot be provided."""
+
+
+def _fs_isolation_script(workdir: str) -> str:
+    """Build the sh script that hides the host's private files, then execs the child.
+
+    Run under ``unshare --user --map-root-user --mount``. ``$HOME`` and the
+    runtime root are each replaced by a fresh tmpfs; the interpreter, venv,
+    ``sys.path`` and workdir directories that live beneath them are bound back
+    in (read-only, except the workdir), and every ``.env*`` file directly in a
+    ``sys.path`` entry is covered with ``/dev/null``.
+    """
+    from src.config.paths import get_runtime_root
+
+    def real(path: Any) -> str:
+        return os.path.realpath(str(path))
+
+    def inside(path: str, root: str) -> bool:
+        return path == root or path.startswith(root.rstrip("/") + "/")
+
+    hidden: list[str] = []
+    for root in sorted({real(Path.home()), real(get_runtime_root())}, key=len):
+        if not any(inside(root, kept) for kept in hidden):
+            hidden.append(root)
+    code_dirs = [real(entry) for entry in sys.path if entry and os.path.isdir(entry)]
+    keep = {real(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)} | set(code_dirs)
+    workdir = real(workdir)
+    q = shlex.quote
+    lines = ["set -e"]
+    for index, root in enumerate(hidden):
+        stage = f'"$stage{index}"'
+        lines += [f"stage{index}=$(mktemp -d)", f"mount -t tmpfs -o mode=0755 tmpfs {stage}"]
+        for path in sorted(p for p in keep | {workdir} if inside(p, root) and p != root):
+            target = f"{stage}/{q(os.path.relpath(path, root))}"
+            lines += [f"mkdir -p {target}", f"mount --rbind {q(path)} {target}"]
+            if path != workdir:
+                lines.append(f"mount -o remount,bind,ro {target}")
+        lines.append(f"mount --move {stage} {q(root)}")
+    for directory in code_dirs:
+        for name in sorted(os.listdir(directory)):
+            if name.startswith(".env") and os.path.isfile(os.path.join(directory, name)):
+                lines.append(f"mount --bind /dev/null {q(os.path.join(directory, name))}")
+    lines.append('exec "$@"')
+    return "\n".join(lines)
+
+
+def _fs_isolation_prefix(workdir: str) -> list[str]:
+    """Return the argv prefix for ``required`` mode, or raise if the host cannot do it.
+
+    Probed with the real script, so a host that allows user namespaces but not
+    the mounts still refuses instead of starting an unconfined child.
+    """
+    unshare, sh = shutil.which("unshare"), shutil.which("sh")
+    if not sys.platform.startswith("linux") or unshare is None or sh is None:
+        raise SandboxFilesystemIsolationError(
+            "VIBE_TRADING_SANDBOX_FS=required needs Linux with 'unshare'; refusing to run "
+            "strategy code without a filesystem boundary. Set it to 'auto' to rely on the "
+            "in-process guard only."
+        )
+    prefix = [unshare, "--user", "--map-root-user", "--mount", "--", sh, "-c",
+              _fs_isolation_script(workdir), "vt-fs-sandbox"]
+    try:
+        probe = subprocess.run([*prefix, sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SandboxFilesystemIsolationError(f"filesystem sandbox probe failed: {exc}") from exc
+    if probe.returncode != 0:
+        raise SandboxFilesystemIsolationError(
+            "VIBE_TRADING_SANDBOX_FS=required, but the mount-namespace sandbox could not be "
+            "set up (user namespaces disabled or mounts refused): "
+            + probe.stderr.decode(errors="replace").strip()[-300:]
+        )
+    return prefix
+
+
 def start_strategy_process(payload: dict[str, Any]):
     """Start an isolated interpreter and deliver the validated source snapshot.
 
@@ -132,6 +213,7 @@ def start_strategy_process(payload: dict[str, Any]):
     Returns:
         The child process and its private bidirectional message connection.
     """
+    from src.core.fs_guard import fs_mode
     from src.core.runner import _copy_runtime_env
 
     # Preserve import paths for editable installs and standalone MCP hosts.
@@ -142,8 +224,9 @@ def start_strategy_process(payload: dict[str, Any]):
     )
     workdir = tempfile.mkdtemp(prefix="vt-paper-strategy-")
     try:
+        prefix = _fs_isolation_prefix(workdir) if fs_mode() == "required" else []
         process = subprocess.Popen(
-            [sys.executable, "-B", "-u", "-c", bootstrap],
+            [*prefix, sys.executable, "-B", "-u", "-c", bootstrap],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             close_fds=True, cwd=workdir, env=_copy_runtime_env(),
         )

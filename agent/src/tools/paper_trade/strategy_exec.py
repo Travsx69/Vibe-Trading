@@ -69,6 +69,7 @@ from __future__ import annotations
 import ast
 import logging
 import math
+import os
 import sys
 import types
 from dataclasses import dataclass, field
@@ -359,10 +360,14 @@ def _child_main(conn: Any, payload: dict[str, Any]) -> None:
     # any Exception → ("error", day, class name) and exit.  KeyboardInterrupt
     # /SystemExit deliberately propagate (operator signals, not strategy
     # errors) — the parent reads the dead pipe as StrategyProcessError.
+    from src.core.fs_guard import confine_files
+
     days = payload["days"]
+    workdir = os.getcwd()  # the private temp dir start_strategy_process chose
     try:
-        module = _load_validated_source(payload["source"], payload["filename"])
-        generate = _discover_entry(module)
+        with confine_files(workdir):
+            module = _load_validated_source(payload["source"], payload["filename"])
+            generate = _discover_entry(module)
     except Exception as exc:
         conn.send(("error", days[0], type(exc).__name__))
         return
@@ -372,7 +377,8 @@ def _child_main(conn: Any, payload: dict[str, Any]) -> None:
             state, frames = conn.recv()
             ctx = StrategyContext(account_state=state, trade_date=day,
                                   symbols=payload["symbols"], _frames=frames)
-            raw = generate(ctx, day)
+            with confine_files(workdir):
+                raw = generate(ctx, day)
             if not isinstance(raw, (list, tuple)):
                 raise StrategyOrderError(
                     f"generate_signals must return a list of order objects on {day}, "
