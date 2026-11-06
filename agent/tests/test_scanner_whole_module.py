@@ -74,7 +74,120 @@ _BYPASSES = {
     "to_pickle_relative": _ENGINE + "        data_map['a'].to_pickle('x.pkl')\n        return {}\n",
     "numpy_save": "import numpy as np\n" + _ENGINE + "        np.save('x.npy', 1)\n        return {}\n",
     "open_url_literal": _ENGINE + "        return open('https://attacker.example')\n",
+    # Indirect data-I/O calls the attribute check cannot see
+    "from_pandas_import_read_csv": (
+        "from pandas import read_csv\n" + _ENGINE + "        return read_csv('https://attacker.example/x')\n"
+    ),
+    "read_csv_as_value": (
+        "import pandas as pd\n" + _ENGINE + "        f = pd.read_csv\n        return f('/etc/passwd')\n"
+    ),
+    "getattr_literal_read_csv": (
+        "import pandas as pd\n" + _ENGINE + "        return getattr(pd, 'read_csv')('/etc/passwd')\n"
+    ),
+    "getattr_computed_on_module": (
+        "import pandas as pd\n" + _ENGINE + "        return getattr(pd, 'read_' + 'csv')('/etc/passwd')\n"
+    ),
+    "getattr_pathlib_read_text": (
+        "from pathlib import Path\n" + _ENGINE
+        + "        return getattr(Path.home() / 'secret.txt', 'read_text')()\n"
+    ),
+    "numpy_load_allow_pickle_positional": (
+        "import numpy as np\n" + _ENGINE + "        return np.load('x.npy', None, True)\n"
+    ),
 }
+
+# Every one of these executes a pickle payload sitting in the run dir; a
+# relative path is no protection. Exercised end to end below.
+_DESERIALIZERS = {
+    "pd_read_pickle": "import pandas as pd\n" + _ENGINE + "        return pd.read_pickle('payload.pkl')\n",
+    "pd_io_read_pickle": (
+        "import pandas as pd\n" + _ENGINE + "        return pd.io.pickle.read_pickle('payload.pkl')\n"
+    ),
+    "from_import_alias": (
+        "from pandas import read_pickle as rp\n" + _ENGINE + "        return rp('payload.pkl')\n"
+    ),
+    "getattr_alias": (
+        "import pandas as pd\n" + _ENGINE + "        return getattr(pd, 'read_pickle')('payload.pkl')\n"
+    ),
+    "value_alias": (
+        "import pandas as pd\n" + _ENGINE + "        f = pd.read_pickle\n        return f('payload.pkl')\n"
+    ),
+    "np_load_allow_pickle": (
+        "import numpy as np\n" + _ENGINE + "        return np.load('payload.pkl', allow_pickle=True)\n"
+    ),
+    "pd_read_hdf": "import pandas as pd\n" + _ENGINE + "        return pd.read_hdf('payload.h5')\n",
+    "pd_hdfstore": "import pandas as pd\n" + _ENGINE + "        return pd.HDFStore('payload.h5')['x']\n",
+    "joblib_load": "import joblib\n" + _ENGINE + "        return joblib.load('payload.pkl')\n",
+    "dill_load": "import dill\n" + _ENGINE + "        return dill.load(open('payload.pkl', 'rb'))\n",
+    "cloudpickle_load": "import cloudpickle\n" + _ENGINE + "        return cloudpickle.load(open('payload.pkl', 'rb'))\n",
+    "underscore_pickle": "import _pickle\n" + _ENGINE + "        return _pickle.load(open('payload.pkl', 'rb'))\n",
+    "shelve_open": "import shelve\n" + _ENGINE + "        return shelve.open('payload')['x']\n",
+    "yaml_unsafe": "import yaml\n" + _ENGINE + "        return yaml.unsafe_load(open('payload.yml'))\n",
+}
+_BYPASSES.update({f"deserializer_{k}": v for k, v in _DESERIALIZERS.items()})
+
+
+class _Payload:
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+
+    def __reduce__(self):
+        return (open, (self.marker, "w"))
+
+
+_CHILD = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from backtest.runner import _load_module_from_file\n"
+    "try:\n"
+    "    m = _load_module_from_file(Path('signal_engine.py'), 'signal_engine')\n"
+    "except ValueError as exc:\n"
+    "    print('REJECTED', exc)\n"
+    "    sys.exit(0)\n"
+    "m.SignalEngine().generate({})\n"
+    "print('RAN')\n"
+)
+
+
+def _run_child(run_dir, agent_root):
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "PYTHONPATH": str(agent_root)}
+    return subprocess.run(
+        [sys.executable, "-c", _CHILD], cwd=run_dir, env=env, capture_output=True, text=True, timeout=120
+    )
+
+
+@pytest.mark.parametrize("source", list(_DESERIALIZERS.values()), ids=list(_DESERIALIZERS))
+def test_deserializer_payload_never_executes_in_the_child(tmp_path, source) -> None:
+    import pickle
+    from pathlib import Path
+
+    agent_root = Path(__file__).resolve().parents[1]
+    marker = tmp_path / "outside" / "PWNED"
+    marker.parent.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    payload = pickle.dumps(_Payload(str(marker)))
+    for name in ("payload.pkl", "payload.h5", "payload.yml", "payload"):
+        (run_dir / name).write_bytes(payload)
+    (run_dir / "signal_engine.py").write_text('"""Generated signal engine."""\n' + source, encoding="utf-8")
+
+    result = _run_child(run_dir, agent_root)
+
+    assert "REJECTED" in result.stdout, result.stdout + result.stderr
+    assert not marker.exists()
+
+
+def test_deserializer_payload_is_live(tmp_path) -> None:
+    """Control: the same payload really runs when something unpickles it."""
+    import pickle
+
+    marker = tmp_path / "PWNED"
+    pickle.loads(pickle.dumps(_Payload(str(marker)))).close()
+    assert marker.exists()
 
 
 @pytest.mark.parametrize("source", list(_BYPASSES.values()), ids=list(_BYPASSES))
@@ -101,6 +214,17 @@ _LEGITIMATE = {
     ),
     "json_loads": "import json\n" + _ENGINE + "        return json.loads('{}')\n",
     "typing_and_math": "import math\nfrom typing import Dict\n" + _ENGINE + "        return {'x': math.sqrt(4)}\n",
+    # In-memory parsing touches no file
+    "numpy_loadtxt_stringio": (
+        "import numpy as np\nfrom io import StringIO\n" + _ENGINE + "        return np.loadtxt(StringIO('1 2 3'))\n"
+    ),
+    "pandas_read_csv_io_stringio": (
+        "import io\nimport pandas as pd\n" + _ENGINE + "        return pd.read_csv(io.StringIO('a\\n1'))\n"
+    ),
+    "numpy_load_bytesio_no_pickle": (
+        "import io\nimport numpy as np\n" + _ENGINE + "        return np.load(io.BytesIO(b''), allow_pickle=False)\n"
+    ),
+    "getattr_on_user_object": _ENGINE + "        return {k: getattr(v, 'close') for k, v in data_map.items()}\n",
 }
 
 

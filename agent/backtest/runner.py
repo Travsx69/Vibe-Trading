@@ -422,6 +422,17 @@ _FORBIDDEN_IMPORT_MODULES = frozenset(
         # indirects around both the attribute and the getattr checks.
         "inspect",
         "operator",
+        # Deserializers that run code from a data file (pickle protocol or
+        # python/object tags): a relative path is no protection when the run
+        # dir itself can hold the payload.
+        "_pickle",
+        "shelve",
+        "copyreg",
+        "dill",
+        "cloudpickle",
+        "joblib",
+        "jsonpickle",
+        "yaml",
     }
 )
 # Project-internal subtrees that reach a broker. The red line is that no
@@ -554,21 +565,25 @@ _FORBIDDEN_DUNDER_ATTRS = frozenset(
 )
 # Data-library file/URL I/O. pandas resolves ``http(s)://`` arguments itself,
 # so ``pd.read_csv(url)`` was an exfiltration channel the import list never saw,
-# and ``read_pickle``/``np.load``/``joblib.load`` deserialize code. A read must
-# name a relative literal path (resolved under the run dir), like open().
+# A read must name a relative literal path (resolved under the run dir), like
+# open(), or an in-memory ``StringIO``/``BytesIO`` buffer.
 _DATA_READ_ATTRS = frozenset(
     {
         "read_csv", "read_table", "read_fwf", "read_json", "read_html", "read_xml",
-        "read_excel", "read_parquet", "read_feather", "read_orc", "read_pickle",
-        "read_hdf", "read_stata", "read_sas", "read_spss",
+        "read_excel", "read_parquet", "read_feather", "read_orc",
+        "read_stata", "read_sas", "read_spss",
         "load", "loadtxt", "genfromtxt", "fromfile", "memmap",
     }
 )
-# Database / network / clipboard I/O has no relative-path form at all.
+# Database / network / clipboard I/O has no relative-path form at all, and
+# read_pickle/read_hdf/HDFStore unpickle the file (PyTables object columns too),
+# which executes whatever a payload in the run dir says.
 _DATA_IO_ALWAYS_FORBIDDEN_ATTRS = frozenset(
     {"read_sql", "read_sql_query", "read_sql_table", "read_gbq", "read_clipboard",
-     "to_sql", "to_gbq", "to_clipboard"}
+     "to_sql", "to_gbq", "to_clipboard", "read_pickle", "read_hdf", "HDFStore"}
 )
+_IN_MEMORY_BUFFERS = frozenset({"StringIO", "BytesIO"})
+_PATHLIB_READ_ATTRS = frozenset({"open", "read_text", "read_bytes"})
 # Writes are refused whenever a target is given; the no-target forms
 # (``df.to_json()``, ``df.to_csv(index=False)``) just return a string.
 _DATA_WRITE_ATTRS = frozenset(
@@ -579,6 +594,7 @@ _DATA_WRITE_ATTRS = frozenset(
         "tofile", "dump",
     }
 )
+_DATA_IO_NAMES = _DATA_READ_ATTRS | _DATA_IO_ALWAYS_FORBIDDEN_ATTRS | _DATA_WRITE_ATTRS
 _DATA_IO_PATH_KEYWORDS = frozenset(
     {"filepath_or_buffer", "path", "path_or_buf", "path_or_buffer", "io", "fname",
      "file", "filename", "buf", "excel_writer"}
@@ -692,18 +708,45 @@ def _reject_forbidden_data_io(node: ast.Call) -> None:
         raise ValueError(f".{attr}() {_SCRUB_MSG}")
     path_kw = next((kw.value for kw in node.keywords if kw.arg in _DATA_IO_PATH_KEYWORDS), None)
     if attr in _DATA_READ_ATTRS:
+        if attr == "load":
+            # np.load unpickles only with allow_pickle (3rd positional) truthy.
+            allow = next((kw.value for kw in node.keywords if kw.arg == "allow_pickle"), None)
+            if len(node.args) > 2 or not (
+                allow is None or (isinstance(allow, ast.Constant) and allow.value is False)
+            ):
+                raise ValueError(f".load() with allow_pickle {_SCRUB_MSG}")
         target = node.args[0] if node.args else path_kw
         if not (
-            isinstance(target, ast.Constant)
-            and isinstance(target.value, str)
-            and _is_relative_literal_path(target.value)
+            (
+                isinstance(target, ast.Constant)
+                and isinstance(target.value, str)
+                and _is_relative_literal_path(target.value)
+            )
+            or _is_in_memory_buffer(target)
         ):
-            raise ValueError(f".{attr}() of anything but a relative literal path {_SCRUB_MSG}")
+            raise ValueError(
+                f".{attr}() of anything but a relative literal path or StringIO/BytesIO {_SCRUB_MSG}"
+            )
     elif attr in _DATA_WRITE_ATTRS:
         first = node.args[0] if node.args else None
         named = [arg for arg in (first, path_kw) if arg is not None]
         if any(not (isinstance(arg, ast.Constant) and arg.value is None) for arg in named):
             raise ValueError(f"Writing files via .{attr}() {_SCRUB_MSG}")
+
+
+def _is_in_memory_buffer(node: ast.AST | None) -> bool:
+    """Return True for ``StringIO(...)``/``BytesIO(...)``/``io.StringIO(...)``."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in _IN_MEMORY_BUFFERS
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in _IN_MEMORY_BUFFERS
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "io"
+    )
 
 
 def _is_relative_literal_path_ctor(node: ast.AST) -> bool:
@@ -747,7 +790,7 @@ def _reject_forbidden_pathlib_write(node: ast.Call) -> None:
         return
     if func.attr in {"write_text", "write_bytes"}:
         raise ValueError(f"Writing files via .{func.attr}() {_SCRUB_MSG}")
-    if func.attr not in {"open", "read_text", "read_bytes"}:
+    if func.attr not in _PATHLIB_READ_ATTRS:
         return
     if isinstance(func.value, ast.Name) and func.value.id in {"io", "os"}:
         return  # module-level open(path, mode) — _reject_forbidden_open owns it
@@ -820,6 +863,10 @@ def _reject_forbidden_node(node: ast.AST) -> None:
         for alias in node.names:
             if _is_forbidden_module_path(f"{module}.{alias.name}" if module else alias.name):
                 raise ValueError(f"Import of {module}.{alias.name!r} {_SCRUB_MSG}")
+            # A bare name (``from pandas import read_csv``, ``from pandas.io import
+            # pickle``) escapes every check keyed on ``.<attr>``; call it as pd.read_csv.
+            if alias.name in _DATA_IO_NAMES or alias.name in _FORBIDDEN_IMPORT_MODULES:
+                raise ValueError(f"Importing {alias.name!r} by name {_SCRUB_MSG}")
         if root == "os":
             for alias in node.names:
                 if _is_forbidden_os_attr(alias.name):
@@ -862,12 +909,39 @@ def _scan_module(tree: ast.Module) -> None:
     move it out of their sight, so ``os`` may only appear as ``os.<attr>``.
     """
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    module_names = {
+        alias.asname or alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
     for node in ast.walk(tree):
         _reject_forbidden_node(node)
+        parent = parents.get(node)
         if isinstance(node, ast.Name) and node.id == "os":
-            parent = parents.get(node)
             if not (isinstance(parent, ast.Attribute) and parent.value is node):
                 raise ValueError(f"Using the os module as a value {_SCRUB_MSG}")
+        # The data-I/O checks inspect the call's arguments, so the function
+        # must not travel as a value (``f = pd.read_csv; f(url)``).
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Load)
+            and node.attr in _DATA_IO_NAMES
+            and not (isinstance(parent, ast.Call) and parent.func is node)
+        ):
+            raise ValueError(f"Referencing .{node.attr} without calling it {_SCRUB_MSG}")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in _GETATTR_INDIRECTION
+            and len(node.args) >= 2
+        ):
+            name = node.args[1]
+            if isinstance(name, ast.Constant):
+                if name.value in _DATA_IO_NAMES or name.value in _PATHLIB_READ_ATTRS:
+                    raise ValueError(f"{node.func.id}() of {name.value!r} {_SCRUB_MSG}")
+            elif isinstance(node.args[0], ast.Name) and node.args[0].id in module_names:
+                raise ValueError(f"{node.func.id}() of a computed name on a module {_SCRUB_MSG}")
 
 
 def _validate_signal_engine_source(file_path: Path) -> None:

@@ -113,6 +113,44 @@ def test_runner_child_cannot_see_dotenv_by_relative_path(tmp_path: Path) -> None
     assert report == {**report, "dotenv_visible": False, "value": 7, "canary_in_env": False}
 
 
+def test_runner_child_keeps_data_source_config_from_env_and_dotenv(tmp_path, monkeypatch) -> None:
+    pytest.importorskip("rich")
+    pytest.importorskip("dotenv")
+    from src.core.runner import Runner
+    from src.providers import llm
+
+    # GILDATA_TOKEN exported; TickerAll only in .env next to a secret that must stay out.
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(
+        "TICKERALL_API_KEY=dummy-ta-key\nTICKERALL_ACCOUNT_ID=dummy-ta-acct\n"
+        f"OPENAI_API_KEY={CANARY}\nGILDATA_TOKEN=from-dotenv\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(llm, "_ENV_CANDIDATES", [dotenv])
+    monkeypatch.setenv("GILDATA_TOKEN", "dummy-gildata")
+    monkeypatch.delenv("TICKERALL_API_KEY", raising=False)
+    monkeypatch.delenv("TICKERALL_ACCOUNT_ID", raising=False)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    entry = tmp_path / "probe.py"
+    entry.write_text(
+        "import json, os\n"
+        "keys = ('GILDATA_TOKEN', 'TICKERALL_API_KEY', 'TICKERALL_ACCOUNT_ID', 'OPENAI_API_KEY')\n"
+        "print(json.dumps({k: os.environ.get(k) for k in keys}))\n",
+        encoding="utf-8",
+    )
+
+    result = Runner(timeout=60).execute(entry, run_dir, cwd=run_dir)
+
+    assert result.success, result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "GILDATA_TOKEN": "dummy-gildata",
+        "TICKERALL_API_KEY": "dummy-ta-key",
+        "TICKERALL_ACCOUNT_ID": "dummy-ta-acct",
+        "OPENAI_API_KEY": None,
+    }
+
+
 def test_runtime_env_allowlist_keeps_source_order_drops_secrets() -> None:
     pytest.importorskip("rich")
     from src.core.runner import _is_runtime_env_key_allowed

@@ -432,6 +432,15 @@ _RUNTIME_ENV_KEYS = frozenset(
         "TIINGO_API_KEY",
         "FMP_API_KEY",
         "FRED_API_KEY",
+        "GILDATA_TOKEN",
+        "GILDATA_BASE_URL",
+        "TICKERALL_API_KEY",
+        "TICKERALL_ACCOUNT_ID",
+        "VIBE_TRADING_DATA_CACHE_ROOT",
+        "VIBE_TRADING_BAOSTOCK_TIMEOUT",
+        "VIBE_TRADING_GILDATA_MIN_INTERVAL",
+        "VIBE_TRADING_PYKRX_MIN_INTERVAL",
+        "VIBE_TRADING_TICKERALL_MIN_INTERVAL",
         "VIBE_TRADING_IWENCAI_KEY",
         "VIBE_TRADING_SEC_UA",
         "VIBE_TRADING_DATA_CACHE",
@@ -481,9 +490,34 @@ def _copy_runtime_env() -> dict[str, str]:
     LLM, API server, broker, live-trading, or advisory credentials by default.
     The allowlist keeps OS/Python basics, proxy/cert settings, and read-only
     market-data configuration needed by the built-in loaders.
+
+    The child no longer calls ``load_dotenv()``, so allowlisted keys that live
+    only in the agent's ``.env`` are passed through here; exported variables win.
     """
 
-    return {key: value for key, value in os.environ.items() if _is_runtime_env_key_allowed(key)}
+    env = {key: value for key, value in os.environ.items() if _is_runtime_env_key_allowed(key)}
+    for key, value in _dotenv_runtime_values().items():
+        env.setdefault(key, value)
+    return env
+
+
+def _dotenv_runtime_values() -> dict[str, str]:
+    """Return only the allowlisted keys from the first ``.env`` the agent reads."""
+
+    try:
+        from dotenv import dotenv_values
+
+        from src.providers.llm import _ENV_CANDIDATES
+    except ImportError:
+        return {}
+    for candidate in _ENV_CANDIDATES:
+        if candidate.is_file():
+            return {
+                key: value
+                for key, value in dotenv_values(candidate).items()
+                if value is not None and _is_runtime_env_key_allowed(key)
+            }
+    return {}
 
 
 @dataclass

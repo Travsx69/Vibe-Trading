@@ -22,8 +22,10 @@ class _FakeBash(BaseTool):
     parameters = {"type": "object", "properties": {"command": {"type": "string"}}}
     is_readonly = False
 
-    def __init__(self) -> None:
-        self.ran: list[str] = []
+    # Required argument: auto-discovery only instantiates no-arg BaseTool
+    # subclasses, so this fake can never replace the real "bash" tool.
+    def __init__(self, ran: list[str]) -> None:
+        self.ran = ran
 
     def execute(self, **kwargs: Any) -> str:
         self.ran.append(kwargs["command"])
@@ -39,9 +41,16 @@ def _isolated(monkeypatch, tmp_path):
 
 def _registry() -> tuple[ToolRegistry, _FakeBash]:
     registry = ToolRegistry()
-    tool = _FakeBash()
+    tool = _FakeBash([])
     registry.register(tool)
     return registry, tool
+
+
+def test_discovery_keeps_the_real_bash_tool() -> None:
+    from src.tools import build_registry
+    from src.tools.bash_tool import BashTool
+
+    assert type(build_registry(include_shell_tools=True).get("bash")) is BashTool
 
 
 # --------------------------------------------------------------------------- #
