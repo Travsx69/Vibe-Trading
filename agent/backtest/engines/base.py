@@ -53,6 +53,7 @@ from backtest.rebalance_mask import (
     resolve_rebalance_dates,
     validate_rebalance_mask,
 )
+from src.core.fs_guard import FileAccessDenied, confine_files
 from src.core.network_guard import NetworkAccessDenied, deny_network
 
 
@@ -1008,10 +1009,13 @@ class BaseEngine(ABC):
 
         # 2. Generate signals
         try:
-            with deny_network():
+            with deny_network(), confine_files("."):  # cwd is the run dir
                 signal_map = signal_engine.generate(data_map)
         except NetworkAccessDenied as exc:
             print(json.dumps({"error": f"Network access denied: {exc}"}))
+            sys.exit(1)
+        except FileAccessDenied as exc:
+            print(json.dumps({"error": f"File access denied: {exc}"}))
             sys.exit(1)
         if not isinstance(signal_map, dict):
             print(json.dumps({"error": (

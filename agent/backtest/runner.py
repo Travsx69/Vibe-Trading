@@ -54,6 +54,7 @@ from backtest.engines._market_hooks import (  # noqa: F401  (re-exported)
 )
 from backtest.rebalance_mask import RebalanceMask, validate_rebalance_mask
 
+from src.core.fs_guard import FileAccessDenied, confine_files
 from src.core.network_guard import NetworkAccessDenied, deny_network
 
 logger = logging.getLogger(__name__)
@@ -1686,10 +1687,13 @@ def main(run_dir: Path) -> None:
     # module may do at import time, not what ``__init__`` may do, so the
     # constructor needs the same guard as ``generate``.
     try:
-        with deny_network():
+        with deny_network(), confine_files("."):  # cwd is the run dir
             signal_engine = engine_cls()
     except NetworkAccessDenied as exc:
         print(json.dumps({"error": f"Network access denied: {exc}"}))
+        sys.exit(1)
+    except FileAccessDenied as exc:
+        print(json.dumps({"error": f"File access denied: {exc}"}))
         sys.exit(1)
 
     # Annualization bars

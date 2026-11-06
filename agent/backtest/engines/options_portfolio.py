@@ -30,6 +30,7 @@ import pandas as pd
 
 from backtest.engines.base import evaluation_start_index
 from backtest.metrics import effective_bars_per_year, period_returns
+from src.core.fs_guard import FileAccessDenied, confine_files
 from src.core.network_guard import NetworkAccessDenied, deny_network
 from src.quantlib.options import bs_greeks, bs_price, normalise_option_type
 
@@ -266,10 +267,13 @@ def run_options_backtest(
 
     # Generate trade signals
     try:
-        with deny_network():
+        with deny_network(), confine_files("."):  # cwd is the run dir
             signals = engine.generate(data_map)
     except NetworkAccessDenied as exc:
         print(json.dumps({"error": f"Network access denied: {exc}"}))
+        sys.exit(1)
+    except FileAccessDenied as exc:
+        print(json.dumps({"error": f"File access denied: {exc}"}))
         sys.exit(1)
 
     # Build trading date sequence

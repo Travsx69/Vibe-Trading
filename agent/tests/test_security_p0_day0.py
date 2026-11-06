@@ -17,6 +17,7 @@ import io
 import json
 import os
 import pickle
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -513,6 +514,98 @@ def test_fs_isolation_prefix_hides_home_runtime_root_and_dotenv(sp, tmp_path, mo
     assert json.loads(result.stdout) == {"secret": False, "dotenv": "", "value": 7}
     assert (workdir / "w.txt").read_text() == "ok"
     assert (home / ".vibe-trading" / "okx.json").read_text(encoding="utf-8") == CANARY
+
+
+# The backtest child arms the same guard around SignalEngine() and generate().
+# Run in its own interpreter, cwd = run dir as backtest_tool sets it, with the
+# scanner stubbed so the boundary itself is what is tested.
+_BACKTEST_DRIVER = r"""
+import json, os, sys
+from pathlib import Path
+import pandas as pd
+import backtest.benchmark as benchmark
+import backtest.runner as runner
+from backtest.loaders import local_loader
+
+tmp, run = Path(sys.argv[1]), Path(sys.argv[1]) / "run"
+runner._validate_signal_engine_source = lambda path: None
+dates = pd.bdate_range("2026-01-05", periods=5)
+closes = [100.0, 110.0, 120.0, 130.0, 140.0]
+pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes,
+              "volume": [1000.0] * 5}, index=dates).rename_axis("date").to_csv(tmp / "AAPL.US.csv")
+bridge = tmp / "bridge.json"
+bridge.write_text(json.dumps({"sources": [{"symbol": "AAPL.US", "type": "csv",
+                                           "path": str(tmp / "AAPL.US.csv")}]}))
+local_loader._CONFIG_PATH = bridge
+
+class _NoNetwork:
+    def fetch(self, *args, **kwargs):
+        return {}
+
+benchmark.YfinanceLoader = _NoNetwork
+os.chdir(run)
+runner.main(run)
+"""
+
+
+def _run_backtest_child(tmp_path, engine_source: str, *, mode: str | None = None):
+    run = tmp_path / "run"
+    (run / "code").mkdir(parents=True)
+    (run / "code" / "signal_engine.py").write_text(engine_source, encoding="utf-8")
+    (run / "config.json").write_text(json.dumps({
+        "codes": ["AAPL.US"], "source": "local", "initial_cash": 100_000,
+        "start_date": "2026-01-05", "end_date": "2026-01-09",
+    }), encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(AGENT_ROOT), "VIBE_TRADING_DATA_CACHE": "0",
+           "VIBE_TRADING_ALLOWED_RUN_ROOTS": str(tmp_path)}
+    env.pop("VIBE_TRADING_SANDBOX_FS", None)
+    if mode:
+        env["VIBE_TRADING_SANDBOX_FS"] = mode
+    return subprocess.run([sys.executable, "-c", _BACKTEST_DRIVER, str(tmp_path)], cwd=run,
+                          env=env, capture_output=True, text=True, timeout=180)
+
+
+@pytest.mark.parametrize("where", ["__init__", "generate"])
+def test_backtest_child_cannot_read_host_files(tmp_path, where) -> None:
+    secret = tmp_path / "home" / ".vibe-trading" / "okx.json"
+    secret.parent.mkdir(parents=True)
+    secret.write_text(CANARY, encoding="utf-8")
+    read = f"open({str(secret)!r}).read()"
+    engine = (
+        "class SignalEngine:\n"
+        f"    def __init__(self):\n        {read if where == '__init__' else 'pass'}\n"
+        "    def generate(self, data_map):\n"
+        f"        {read if where == 'generate' else 'pass'}\n"
+        "        return {k: v['close'] * 0 for k, v in data_map.items()}\n"
+    )
+
+    result = _run_backtest_child(tmp_path, engine)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "File access denied" in result.stdout, result.stdout + result.stderr
+    assert CANARY not in result.stdout + result.stderr
+
+
+def test_backtest_child_keeps_run_dir_files_and_guard_off_is_the_control(tmp_path) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text(CANARY, encoding="utf-8")
+    engine = (
+        "class SignalEngine:\n"
+        "    def generate(self, data_map):\n"
+        "        import statistics\n"
+        "        open('scratch.txt', 'w').write('1')\n"
+        "        assert open('config.json').read()\n"
+        f"        self.leak = open({str(secret)!r}).read() if {{MODE}} else ''\n"
+        "        return {k: v['close'] * 0 for k, v in data_map.items()}\n"
+    )
+
+    ok = _run_backtest_child(tmp_path, engine.replace("{MODE}", "False"))
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert (tmp_path / "run" / "run_card.json").exists()
+
+    shutil.rmtree(tmp_path / "run")
+    control = _run_backtest_child(tmp_path, engine.replace("{MODE}", "True"), mode="off")
+    assert control.returncode == 0, control.stdout + control.stderr
 
 
 def test_paper_child_guard_off_is_the_control(sp, secrets, monkeypatch) -> None:
