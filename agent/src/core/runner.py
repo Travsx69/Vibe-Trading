@@ -17,6 +17,8 @@ from typing import Any, Dict, Optional
 
 from rich.console import Console
 
+from src.core.network_guard import network_mode
+
 try:  # POSIX-only; absent on Windows
     import resource
 except ImportError:  # pragma: no cover - Windows
@@ -118,11 +120,19 @@ def _rlimit_as_bytes() -> int:
 # Running the same setrlimit calls after exec, in a single-threaded interpreter,
 # is safe on every platform and keeps the identical ceiling.
 #
-# argv contract: ``python -c BOOTSTRAP <as_bytes> <nofile> <entry> [args...]``.
-_SANDBOX_RLIMIT_BOOTSTRAP = """\
+# The same exec'd bootstrap also installs the execution-phase network guard, so
+# a manual ``python -m backtest.runner`` run is covered too, not only the
+# runner-spawned child. That install is fail-closed: if the guard module cannot
+# be imported the child exits with a message instead of running strategy code
+# unguarded. ``off`` is the one mode where nothing is installed on purpose.
+#
+# argv contract: ``python -c BOOTSTRAP <agent_root> <as_bytes> <nofile> <entry>
+# [args...]``. An ``as_bytes``/``nofile`` of 0 means "no resource module here";
+# the rlimit pass is then skipped but the guard still installs.
+_SANDBOX_BOOTSTRAP = """\
 import os, runpy, sys
-_as_bytes, _nofile = int(sys.argv[1]), int(sys.argv[2])
-sys.argv = sys.argv[3:]
+_agent_root, _as_bytes, _nofile = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+sys.argv = sys.argv[4:]
 try:
     import resource
 except ImportError:
@@ -132,6 +142,8 @@ if resource is not None:
         (resource.RLIMIT_AS, _as_bytes),
         (resource.RLIMIT_NOFILE, _nofile),
     ):
+        if _target <= 0:
+            continue
         try:
             _soft, _hard = resource.getrlimit(_res)
             _new_hard = _target if _hard == resource.RLIM_INFINITY else min(_target, _hard)
@@ -139,36 +151,120 @@ if resource is not None:
         except (ValueError, OSError):
             pass
 sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[0])))
+sys.path.insert(0, _agent_root)
+try:
+    from src.core.network_guard import install as _install_network_guard
+    _install_network_guard()
+except Exception as _exc:
+    _mode = os.environ.get("VIBE_TRADING_SANDBOX_NETWORK", "").strip().lower()
+    if _mode not in {"off", "0", "false", "no"}:
+        sys.stderr.write("sandbox network guard failed to install: %r\\n" % (_exc,))
+        raise SystemExit(70)
 runpy.run_path(sys.argv[0], run_name="__main__")
 """
 
+#: Env gate for the sandbox network layer (see ``src.core.network_guard``).
+#: ``required`` also wraps the child in a fresh network namespace; ``off``
+#: disables both layers; unset/``auto`` keeps the execution-phase guard only.
+_SANDBOX_NETWORK_ENV = "VIBE_TRADING_SANDBOX_NETWORK"
 
-def _rlimit_bootstrap_argv() -> list[str] | None:
-    """Return the ``-c`` bootstrap argv prefix that caps address space + fds.
 
-    Returns None on Windows (no ``resource`` module), where the caller runs the
-    entry script directly and no ceiling is applied — unchanged from before.
+def _sandbox_bootstrap_argv(agent_root: Path) -> list[str]:
+    """Return the always-present ``-c`` bootstrap argv prefix.
+
+    The bootstrap caps address space + fds *and* installs the execution-phase
+    network guard. It is used on every platform: Windows has no ``resource``
+    module, so it receives ``0``/``0`` for the two limits and skips them, but
+    the network guard still has to be installed there.
 
     The two limits are resolved in the parent and passed as literal argv values
     so the env parsing keeps a single source of truth (``_rlimit_as_bytes``).
     The bootstrap lowers limits best-effort: a hardened parent limit already
     below the target is never raised, and it runs after any UID drop, where
     lowering is always permitted for an unprivileged process. It then puts the
-    entry script's own directory on sys.path, which ``python script.py`` does
-    for free and ``python -c`` does not; the cwd entry ``-c`` leaves behind is
-    harmless because execute() already exports an explicit cwd on PYTHONPATH.
+    entry script's own directory and ``agent_root`` on sys.path; the former is
+    what ``python script.py`` does for free and ``python -c`` does not, the
+    latter lets the guard import ``src.core`` regardless of cwd. The cwd entry
+    ``-c`` leaves behind is harmless because execute() already exports an
+    explicit cwd on PYTHONPATH.
+
+    Args:
+        agent_root: Directory containing ``src/`` and ``backtest/``, put on
+            ``sys.path`` so the child can import the network guard.
 
     Returns:
-        ``["-c", <bootstrap>, <as_bytes>, <nofile>]`` on POSIX, else None.
+        ``["-c", <bootstrap>, <agent_root>, <as_bytes>, <nofile>]``.
     """
     if resource is None:
-        return None
+        as_bytes = nofile = 0
+    else:
+        as_bytes = _rlimit_as_bytes()
+        nofile = _SANDBOX_RLIMIT_NOFILE
     return [
         "-c",
-        _SANDBOX_RLIMIT_BOOTSTRAP,
-        str(_rlimit_as_bytes()),
-        str(_SANDBOX_RLIMIT_NOFILE),
+        _SANDBOX_BOOTSTRAP,
+        str(agent_root),
+        str(as_bytes),
+        str(nofile),
     ]
+
+
+class SandboxNetworkIsolationError(RuntimeError):
+    """Raised when ``required`` network isolation cannot be provided.
+
+    A deployment that asked for the boundary must not silently get a run in
+    which strategy code can reach the network, so this is fatal.
+    """
+
+
+def _sandbox_network_prefix() -> list[str]:
+    """Return the argv prefix that puts the child in a fresh network namespace.
+
+    Only called in ``required`` mode. ``unshare --net`` needs a working user
+    namespace, so the flag set is probed rather than assumed: ``--map-root-user``
+    is tried first because it works for an unprivileged caller on hosts that
+    allow unprivileged user namespaces, and bare ``--net`` is the fallback for
+    a host where the runner already has the capability.
+
+    The probe runs uncached so tests can substitute ``shutil.which``; it costs
+    one short-lived interpreter per backtest, which is negligible next to the
+    run itself.
+
+    Returns:
+        ``[<unshare>, *flags, "--"]``.
+
+    Raises:
+        SandboxNetworkIsolationError: If no working ``unshare`` invocation
+            exists. Refusing loudly is the point of ``required``.
+    """
+    if resource is None or shutil.which("unshare") is None:
+        raise SandboxNetworkIsolationError(
+            "VIBE_TRADING_SANDBOX_NETWORK=required, but this host cannot create "
+            "a network namespace (no resource module or no 'unshare' binary). "
+            "Refusing to run generated code with network access; set the "
+            "variable to 'off' to run without the boundary deliberately."
+        )
+    unshare = shutil.which("unshare")
+    assert unshare is not None  # narrowed by the check above
+    for flags in (["--net", "--map-root-user"], ["--net"]):
+        try:
+            probe = subprocess.run(
+                [unshare, *flags, "--", sys.executable, "-c", "pass"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return [unshare, *flags, "--"]
+    raise SandboxNetworkIsolationError(
+        "VIBE_TRADING_SANDBOX_NETWORK=required, but 'unshare --net' is not "
+        "usable on this host (user namespaces disabled, or the runner lacks "
+        "CAP_SYS_ADMIN). Refusing to run generated code with network access; "
+        "set the variable to 'off' to run without the boundary deliberately."
+    )
 
 
 def _reexpose_mt5_config(src_root: Path, dst_root: Path) -> None:
@@ -340,6 +436,7 @@ _RUNTIME_ENV_KEYS = frozenset(
         "VIBE_TRADING_SEC_UA",
         "VIBE_TRADING_DATA_CACHE",
         "VIBE_TRADING_ALLOWED_RUN_ROOTS",
+        "VIBE_TRADING_SANDBOX_NETWORK",
         "CCXT_EXCHANGE",
         "CCXT_TIMEOUT_MS",
         "CCXT_FETCH_BUDGET_S",
@@ -682,12 +779,20 @@ class Runner:
         python_cmd = self._pick_python_interpreter()
         console.print(f"[dim]Runner: using Python: {python_cmd}[/dim]")
 
-        # The rlimit ceiling is applied by the exec'd interpreter itself, never
-        # by a preexec_fn — see _SANDBOX_RLIMIT_BOOTSTRAP for why (#1355).
-        bootstrap = _rlimit_bootstrap_argv()
-        cmd = [python_cmd, *(bootstrap or []), str(entry_script)]
+        # The rlimit ceiling and the execution-phase network guard are installed
+        # by the exec'd interpreter itself, never by a preexec_fn — see
+        # _SANDBOX_BOOTSTRAP for why (#1355).
+        bootstrap = _sandbox_bootstrap_argv(Path(__file__).resolve().parents[2])
+        cmd = [python_cmd, *bootstrap, str(entry_script)]
         if cli_args:
             cmd.extend(cli_args)
+
+        # ``required`` puts the whole child in a fresh network namespace, which
+        # is stricter than the per-call guard: even the data fetch cannot reach
+        # out. Resolved before the ephemeral HOME exists so a refusal leaves no
+        # temp directory behind.
+        if network_mode() == "required":
+            cmd = [*_sandbox_network_prefix(), *cmd]
 
         # VT-001 defense-in-depth: give the generated-code subprocess an ephemeral
         # HOME (so it can't read the persistent ~/.vibe-trading secrets/state),

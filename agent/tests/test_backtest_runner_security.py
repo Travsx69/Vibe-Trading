@@ -235,6 +235,18 @@ _MODULE_LEVEL_ALIAS_BYPASSES = [
         "import src.trading.service as t",
         "        return t.place_order(1)",
     ),
+    # The sandbox's own internals are forbidden too: a strategy that can import
+    # the network guard could reach its module state and disarm it.
+    (
+        "from_core_network_guard",
+        "from src.core import network_guard as ng",
+        "        return ng._STATE.clear()",
+    ),
+    (
+        "import_core_network_guard",
+        "import src.core.network_guard as ng",
+        "        return ng._STATE.clear()",
+    ),
 ]
 
 

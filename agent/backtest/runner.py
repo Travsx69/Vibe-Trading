@@ -54,6 +54,8 @@ from backtest.engines._market_hooks import (  # noqa: F401  (re-exported)
 )
 from backtest.rebalance_mask import RebalanceMask, validate_rebalance_mask
 
+from src.core.network_guard import NetworkAccessDenied, deny_network
+
 logger = logging.getLogger(__name__)
 
 _VALID_INTERVALS = {"1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W", "1M"}
@@ -434,8 +436,14 @@ _FORBIDDEN_IMPORT_MODULES = frozenset(
 _FORBIDDEN_IMPORT_PREFIXES = (
     "src.trading",
     "src.live",
+    # The sandbox's own internals: a strategy must not be able to import the
+    # network guard and call its private state to disarm it. ``src.core`` holds
+    # only the runner and that guard; no skill or strategy template imports it
+    # (``src.quantlib`` stays allowed above).
+    "src.core",
     "agent.src.trading",
     "agent.src.live",
+    "agent.src.core",
     "trading.connectors",
     "live.sdk_order_gate",
 )
@@ -1600,7 +1608,15 @@ def main(run_dir: Path) -> None:
 
     # Engine
     engine_type = config.get("engine", "daily")
-    signal_engine = engine_cls()
+    # Instantiation runs strategy code too: the AST scanner governs what the
+    # module may do at import time, not what ``__init__`` may do, so the
+    # constructor needs the same guard as ``generate``.
+    try:
+        with deny_network():
+            signal_engine = engine_cls()
+    except NetworkAccessDenied as exc:
+        print(json.dumps({"error": f"Network access denied: {exc}"}))
+        sys.exit(1)
 
     # Annualization bars
     effective_source = _detect_primary_source(codes, source)

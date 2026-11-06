@@ -2,8 +2,9 @@
 
 Covers: no ``.env`` reload in the backtest child (F3), pathlib reads confined
 to the run dir, broker host pinning and the agent/MCP local-gateway rule (N1),
-paper profiles refusing a live config (F7), and child->parent paper IPC that
-never unpickles (M4) with a scrubbed child environment.
+paper profiles refusing a live config (F7), child->parent paper IPC that never
+unpickles (M4) with a scrubbed child environment, and the P1.1 network guard
+that denies sockets while generated strategy code runs.
 
 Every credential here is a dummy canary; nothing touches a network or broker.
 """
@@ -14,8 +15,10 @@ import ast
 import inspect
 import io
 import json
+import os
 import pickle
 import subprocess
+import sys
 import textwrap
 import uuid
 from pathlib import Path
@@ -24,6 +27,8 @@ import pytest
 
 from backtest import runner as bt_runner
 from backtest.runner import _load_module_from_file
+from src.core import network_guard
+from src.core import runner as sandbox_runner
 from src.trading.endpoint_policy import is_broker_url, is_local_gateway_host
 
 CANARY = "CANARY-" + uuid.uuid4().hex
@@ -353,3 +358,363 @@ def test_paper_strategy_child_gets_scrubbed_env_and_private_cwd(sp, monkeypatch)
     assert "OPENAI_API_KEY" not in captured["env"]
     conn.close()
     assert not workdir.exists()
+
+
+# --------------------------------------------------------------------------- #
+# P1.1: generated strategy code runs with no network
+# --------------------------------------------------------------------------- #
+
+AGENT_ROOT = Path(__file__).resolve().parents[1]
+
+# An audit hook cannot be removed, so anything that arms the guard must run in
+# its own interpreter: arming it in-process would poison every later test.
+_GUARD_PROBE = """
+import json, socket, sys, threading, urllib.request
+
+from src.core import network_guard as ng
+
+report = {}
+report["install"] = [ng.install(), ng.install()]
+report["installed"] = ng.is_installed()
+report["armed_before"] = ng.is_armed()
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 0))
+listener.listen(8)
+port = listener.getsockname()[1]
+
+
+def _serve_one():
+    conn, _ = listener.accept()
+    conn.close()
+
+
+threading.Thread(target=_serve_one, daemon=True).start()
+
+
+def _connect():
+    socket.create_connection(("127.0.0.1", port), timeout=5).close()
+
+
+_connect()
+report["pre_block"] = "ok"
+
+
+def _expect_denied(label, fn):
+    try:
+        fn()
+    except ng.NetworkAccessDenied:
+        report[label] = "denied"
+    except BaseException as exc:
+        report[label] = "other:" + type(exc).__name__
+    else:
+        report[label] = "allowed"
+
+
+with ng.deny_network():
+    report["armed_inside"] = ng.is_armed()
+    # Allocating a socket is not the boundary; moving bytes or resolving a name is.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    report["allocate_inside"] = "ok"
+    _expect_denied("connect", lambda: sock.connect(("127.0.0.1", port)))
+    _expect_denied("connect_ex", lambda: sock.connect_ex(("127.0.0.1", port)))
+    _expect_denied("getaddrinfo", lambda: socket.getaddrinfo("localhost", 80))
+    _expect_denied("gethostbyname", lambda: socket.gethostbyname("localhost"))
+    _expect_denied(
+        "urlopen",
+        lambda: urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=5),
+    )
+    _expect_denied("bind", lambda: sock.bind(("127.0.0.1", 0)))
+    if sys.platform != "win32":
+        # AF_UNIX can reach a host daemon, so it is denied like any other peer.
+        unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        _expect_denied("af_unix", lambda: unix.connect("/tmp/vibe-guard-probe.sock"))
+    with ng.deny_network():
+        report["nested_armed"] = ng.is_armed()
+    report["armed_after_nested"] = ng.is_armed()
+
+report["armed_after"] = ng.is_armed()
+sock.close()
+_connect()
+report["post_block"] = "ok"
+listener.close()
+print(json.dumps(report))
+"""
+
+_OFF_PROBE = """
+import json, socket
+
+from src.core import network_guard as ng
+
+report = {"install": ng.install(), "installed": ng.is_installed()}
+with ng.deny_network():
+    report["armed_inside"] = ng.is_armed()
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.bind(("127.0.0.1", 0))
+listener.listen(8)
+socket.create_connection(("127.0.0.1", listener.getsockname()[1]), timeout=5).close()
+listener.close()
+report["connect"] = "ok"
+print(json.dumps(report))
+"""
+
+
+def _clean_subprocess_env(**extra: str) -> dict[str, str]:
+    """Parent env minus anything that would import or configure the guard."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONPATH", network_guard.ENV_VAR}
+    }
+    env.update(extra)
+    return env
+
+
+def _run_python(
+    args: list[str], *, cwd: Path, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, *args],
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+
+def _run_probe(script: str, **extra_env: str) -> dict:
+    result = _run_python(["-c", script], cwd=AGENT_ROOT, env=_clean_subprocess_env(**extra_env))
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, "auto"),
+        ("", "auto"),
+        ("auto", "auto"),
+        ("somethingelse", "auto"),
+        ("off", "off"),
+        ("OFF", "off"),
+        ("0", "off"),
+        ("false", "off"),
+        ("no", "off"),
+        ("required", "required"),
+        ("Required", "required"),
+        ("1", "required"),
+        ("true", "required"),
+        ("yes", "required"),
+    ],
+)
+def test_network_mode_parsing(monkeypatch, raw: str | None, expected: str) -> None:
+    if raw is None:
+        monkeypatch.delenv(network_guard.ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(network_guard.ENV_VAR, raw)
+    assert network_guard.network_mode() == expected
+
+
+def test_network_access_denied_is_not_an_oserror() -> None:
+    # Retry helpers written for sockets catch OSError; a denial must not look
+    # like a transient connection failure they can quietly swallow and repeat.
+    assert issubclass(network_guard.NetworkAccessDenied, RuntimeError)
+    assert not issubclass(network_guard.NetworkAccessDenied, OSError)
+
+
+def test_deny_network_blocks_sockets_and_releases_after_the_block() -> None:
+    report = _run_probe(_GUARD_PROBE)
+
+    assert report["install"] == [True, True], "install() must be idempotent"
+    assert report["installed"] is True
+    assert report["armed_before"] is False, "installing must not arm the guard"
+    assert report["pre_block"] == "ok", "the child's own data fetch must keep working"
+
+    assert report["armed_inside"] is True
+    assert report["allocate_inside"] == "ok"
+    for label in ("connect", "connect_ex", "getaddrinfo", "gethostbyname", "urlopen", "bind"):
+        assert report[label] == "denied", f"{label} reached the network: {report[label]}"
+    if "af_unix" in report:
+        assert report["af_unix"] == "denied"
+
+    assert report["nested_armed"] is True
+    assert report["armed_after_nested"] is True, "an inner block must not disarm the outer one"
+    assert report["armed_after"] is False
+    assert report["post_block"] == "ok"
+
+
+def test_network_mode_off_leaves_generated_code_unguarded() -> None:
+    report = _run_probe(_OFF_PROBE, **{network_guard.ENV_VAR: "off"})
+
+    assert report["install"] is False
+    assert report["installed"] is False
+    assert report["armed_inside"] is False
+    assert report["connect"] == "ok"
+
+
+def test_sandbox_network_prefix_refuses_without_resource(monkeypatch) -> None:
+    monkeypatch.setattr(sandbox_runner, "resource", None)
+    with pytest.raises(sandbox_runner.SandboxNetworkIsolationError, match="no resource module"):
+        sandbox_runner._sandbox_network_prefix()
+
+
+def test_sandbox_network_prefix_refuses_without_unshare(monkeypatch) -> None:
+    # Fake the resource module so the platform guard does not short-circuit the
+    # check under test on Windows.
+    monkeypatch.setattr(sandbox_runner, "resource", object())
+    monkeypatch.setattr(sandbox_runner.shutil, "which", lambda _name: None)
+    with pytest.raises(sandbox_runner.SandboxNetworkIsolationError, match="no 'unshare' binary"):
+        sandbox_runner._sandbox_network_prefix()
+
+
+def _fake_unshare(monkeypatch, works) -> list[list[str]]:
+    """Install a fake ``unshare`` whose probes succeed where ``works`` says."""
+    monkeypatch.setattr(sandbox_runner, "resource", object())
+    monkeypatch.setattr(sandbox_runner.shutil, "which", lambda _name: "/usr/bin/unshare")
+    calls: list[list[str]] = []
+
+    class _Probe:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    def _run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return _Probe(0 if works(cmd) else 1)
+
+    monkeypatch.setattr(sandbox_runner.subprocess, "run", _run)
+    return calls
+
+
+def test_sandbox_network_prefix_refuses_when_every_probe_fails(monkeypatch) -> None:
+    calls = _fake_unshare(monkeypatch, lambda _cmd: False)
+    with pytest.raises(
+        sandbox_runner.SandboxNetworkIsolationError, match="not usable on this host"
+    ):
+        sandbox_runner._sandbox_network_prefix()
+    assert len(calls) == 2, "both flag sets must be probed before refusing"
+
+
+def test_sandbox_network_prefix_prefers_map_root_user(monkeypatch) -> None:
+    calls = _fake_unshare(monkeypatch, lambda _cmd: True)
+    prefix = sandbox_runner._sandbox_network_prefix()
+    assert prefix == ["/usr/bin/unshare", "--net", "--map-root-user", "--"]
+    assert len(calls) == 1
+
+
+def test_sandbox_network_prefix_falls_back_to_bare_net(monkeypatch) -> None:
+    _fake_unshare(monkeypatch, lambda cmd: "--map-root-user" not in cmd)
+    prefix = sandbox_runner._sandbox_network_prefix()
+    assert prefix == ["/usr/bin/unshare", "--net", "--"]
+
+
+def test_sandbox_bootstrap_installs_guard_and_forwards_argv(tmp_path: Path) -> None:
+    entry = tmp_path / "entry.py"
+    entry.write_text(
+        "import json, sys\n"
+        "from src.core.network_guard import is_installed\n"
+        "print(json.dumps({'argv': sys.argv, 'installed': is_installed()}))\n",
+        encoding="utf-8",
+    )
+    argv = sandbox_runner._sandbox_bootstrap_argv(AGENT_ROOT)
+    if sandbox_runner.resource is None:
+        assert argv[3:] == ["0", "0"], "no resource module: limits skipped, guard still installed"
+
+    # cwd is NOT the agent root and PYTHONPATH is empty, so the import only
+    # works because the bootstrap put agent_root on sys.path.
+    result = _run_python(
+        [*argv, str(entry), "--alpha", "7"],
+        cwd=tmp_path,
+        env=_clean_subprocess_env(),
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    assert report["argv"] == [str(entry), "--alpha", "7"]
+    assert report["installed"] is True
+
+
+def _fake_agent_root(tmp_path: Path) -> Path:
+    """A tree whose ``src.core.network_guard`` cannot be imported."""
+    root = tmp_path / "fake-agent"
+    core = root / "src" / "core"
+    core.mkdir(parents=True)
+    (root / "src" / "__init__.py").write_text("", encoding="utf-8")
+    (core / "__init__.py").write_text("", encoding="utf-8")
+    (core / "network_guard.py").write_text(
+        "raise ImportError('guard unavailable in this build')\n", encoding="utf-8"
+    )
+    return root
+
+
+def test_sandbox_bootstrap_fails_closed_when_guard_cannot_import(tmp_path: Path) -> None:
+    root = _fake_agent_root(tmp_path)
+    entry = tmp_path / "entry.py"
+    entry.write_text("print('RAN')\n", encoding="utf-8")
+
+    result = _run_python(
+        [*sandbox_runner._sandbox_bootstrap_argv(root), str(entry)],
+        cwd=tmp_path,
+        env=_clean_subprocess_env(),
+    )
+
+    assert result.returncode == 70, "an unguarded child must not run strategy code"
+    assert "sandbox network guard failed to install" in result.stderr
+    assert "RAN" not in result.stdout
+
+
+def test_sandbox_bootstrap_does_not_fail_closed_in_off_mode(tmp_path: Path) -> None:
+    root = _fake_agent_root(tmp_path)
+    entry = tmp_path / "entry.py"
+    entry.write_text("print('RAN')\n", encoding="utf-8")
+
+    result = _run_python(
+        [*sandbox_runner._sandbox_bootstrap_argv(root), str(entry)],
+        cwd=tmp_path,
+        env=_clean_subprocess_env(**{network_guard.ENV_VAR: "off"}),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "RAN" in result.stdout
+
+
+@pytest.mark.parametrize("mode", ["required", "auto"])
+def test_execute_places_netns_prefix_only_when_required(
+    monkeypatch, tmp_path: Path, mode: str
+) -> None:
+    prefix = ["/usr/bin/unshare", "--net", "--map-root-user", "--"]
+    monkeypatch.setattr(sandbox_runner, "_sandbox_network_prefix", lambda: list(prefix))
+    if mode == "required":
+        monkeypatch.setenv(network_guard.ENV_VAR, "required")
+    else:
+        monkeypatch.delenv(network_guard.ENV_VAR, raising=False)
+
+    seen: list[list[str]] = []
+
+    def _fake_run(cmd, **_kwargs):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox_runner.subprocess, "run", _fake_run)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    entry = tmp_path / "entry.py"
+    entry.write_text("print('x')\n", encoding="utf-8")
+
+    sandbox_runner.Runner(timeout=60).execute(entry, run_dir, cwd=tmp_path)
+
+    assert seen, "the sandbox subprocess was never launched"
+    launch = seen[-1]
+    if mode == "required":
+        assert launch[: len(prefix)] == prefix
+        # The namespace must wrap the python launch, not sit after it.
+        assert launch[len(prefix)] == sandbox_runner.Runner(timeout=1)._pick_python_interpreter()
+        assert launch[len(prefix) + 1] == "-c"
+        assert launch[len(prefix) + 2] == sandbox_runner._SANDBOX_BOOTSTRAP
+    else:
+        assert "--" not in launch, f"auto mode must not add the namespace prefix: {launch[:4]}"
+        assert launch[1] == "-c"
+        assert launch[2] == sandbox_runner._SANDBOX_BOOTSTRAP

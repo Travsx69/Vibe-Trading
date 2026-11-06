@@ -11,9 +11,9 @@ import pytest
 from src.core import runner as runner_mod
 from src.core.runner import (
     Runner,
-    _rlimit_bootstrap_argv,
     _prepare_sandbox_home,
     _resolve_sandbox_credentials,
+    _sandbox_bootstrap_argv,
 )
 
 
@@ -32,6 +32,7 @@ def test_backtest_runtime_env_keeps_market_data_configuration(
         "VIBE_TRADING_SEC_UA": "Research Bot bot@example.com",
         "VIBE_TRADING_DATA_CACHE": "1",
         "VIBE_TRADING_ALLOWED_RUN_ROOTS": str(tmp_path),
+        "VIBE_TRADING_SANDBOX_NETWORK": "required",
         "VIBE_TRADING_FMP_MIN_INTERVAL": "0.5",
         "CCXT_EXCHANGE": "okx",
         "CCXT_TIMEOUT_MS": "12000",
@@ -275,25 +276,33 @@ def test_prepare_sandbox_home_preseeds_mootdx_config(tmp_path: Path) -> None:
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
-def test_rlimit_bootstrap_argv_shape_on_posix() -> None:
+def test_sandbox_bootstrap_argv_shape_is_cross_platform(tmp_path: Path) -> None:
     # Structural check only; test_execute_applies_address_space_rlimit below
     # proves the ceiling really lands, end-to-end through a real exec.
-    argv = _rlimit_bootstrap_argv()
-    if runner_mod.resource is None:
-        assert argv is None
-        return
+    #
+    # Superseded contract: this helper used to return None on Windows, where the
+    # caller ran the entry script directly. The network guard must install in
+    # the child on every platform, so the bootstrap now always runs and encodes
+    # "no resource module" as the sentinel 0/0.
+    agent_root = tmp_path / "agent"
+    argv = _sandbox_bootstrap_argv(agent_root)
     assert argv[0] == "-c"
-    assert argv[1] == runner_mod._SANDBOX_RLIMIT_BOOTSTRAP
+    assert argv[1] == runner_mod._SANDBOX_BOOTSTRAP
+    # agent_root goes on the child's sys.path so it can import src.core.
+    assert argv[2] == str(agent_root)
     # The two ceilings are resolved in the parent and passed as literal argv,
     # so the child never re-parses the env.
-    assert int(argv[2]) == runner_mod._rlimit_as_bytes()
-    assert int(argv[3]) == runner_mod._SANDBOX_RLIMIT_NOFILE
+    if runner_mod.resource is None:
+        assert argv[3:] == ["0", "0"]
+    else:
+        assert int(argv[3]) == runner_mod._rlimit_as_bytes()
+        assert int(argv[4]) == runner_mod._SANDBOX_RLIMIT_NOFILE
 
 
-def test_rlimit_bootstrap_is_valid_python() -> None:
+def test_sandbox_bootstrap_is_valid_python() -> None:
     import ast
 
-    ast.parse(runner_mod._SANDBOX_RLIMIT_BOOTSTRAP)
+    ast.parse(runner_mod._SANDBOX_BOOTSTRAP)
 
 
 def test_execute_never_passes_preexec_fn(monkeypatch, tmp_path: Path) -> None:
@@ -321,12 +330,11 @@ def test_execute_never_passes_preexec_fn(monkeypatch, tmp_path: Path) -> None:
     assert "no-preexec" in result.stdout
     assert seen, "subprocess.run was never called"
     assert all("preexec_fn" not in call["kwargs"] for call in seen)
-    if runner_mod.resource is not None:
-        # ...and the ceiling is genuinely still requested, so a future patch
-        # cannot satisfy this test by simply dropping the sandbox limits.
-        launch = seen[-1]["cmd"]
-        assert "-c" in launch
-        assert launch[launch.index("-c") + 1] == runner_mod._SANDBOX_RLIMIT_BOOTSTRAP
+    # The bootstrap — and therefore the network guard install — is requested on
+    # every platform, so a future patch cannot satisfy this test by dropping it.
+    launch = seen[-1]["cmd"]
+    assert "-c" in launch
+    assert launch[launch.index("-c") + 1] == runner_mod._SANDBOX_BOOTSTRAP
 
 
 def test_execute_bootstrap_preserves_argv_and_script_dir(tmp_path: Path) -> None:

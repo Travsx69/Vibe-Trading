@@ -53,6 +53,7 @@ from backtest.rebalance_mask import (
     resolve_rebalance_dates,
     validate_rebalance_mask,
 )
+from src.core.network_guard import NetworkAccessDenied, deny_network
 
 
 def _json_safe_scalar_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -1006,7 +1007,12 @@ class BaseEngine(ABC):
         data_map = self.prepare_market_data(data_map)
 
         # 2. Generate signals
-        signal_map = signal_engine.generate(data_map)
+        try:
+            with deny_network():
+                signal_map = signal_engine.generate(data_map)
+        except NetworkAccessDenied as exc:
+            print(json.dumps({"error": f"Network access denied: {exc}"}))
+            sys.exit(1)
         if not isinstance(signal_map, dict):
             print(json.dumps({"error": (
                 f"SignalEngine.generate() must return Dict[str, pd.Series], "
